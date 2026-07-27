@@ -1254,6 +1254,9 @@ class MI_OT_RenameMaterial(Operator):
             return {'CANCELLED'}
         mat.name = self.new_name
 
+        # 同步预览图名称（材质名称变更可能不触发 depsgraph 更新）
+        _sync_preview_on_rename(self.material_name, self.new_name)
+
         # 同步收藏、勾选、激活材质中的名称引用
         settings = context.scene.material_inspector_settings
         old_name = self.material_name
