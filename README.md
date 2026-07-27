@@ -2,6 +2,8 @@
 
 这个是我尝试使用Deepseek和Trae的agent写的一个挺好用的材质预览插件，解决了Blender没有材质管理窗口的问题。
 
+![](./ReadmeImage_001.png)
+
 下面是AI写的介绍：
 
 ---
