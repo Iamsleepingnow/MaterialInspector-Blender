@@ -450,6 +450,7 @@ def generate_material_preview(mat: bpy.types.Material, resolution: int = 256, en
         img = bpy.data.images.load(tmp_path)
         img.name = preview_name
         img.pack()  # 打包到 blend，避免外部文件依赖
+        img.use_fake_user = True  # 防止未引用时被清理
         img.update_tag()  # 标记数据变更，强制后续 preview_ensure 使用最新数据
     finally:
         # 删除临时文件
