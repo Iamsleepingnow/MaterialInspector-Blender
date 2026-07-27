@@ -1506,6 +1506,74 @@ class MI_OT_ToggleFakeUser(Operator):
         return {'FINISHED'}
 
 
+class MI_OT_SelectModelMaterials(Operator):
+    """根据选中模型的材质列表来勾选材质（并集/交集/差集）"""
+    bl_idname = "material_inspector.select_model_materials"
+    bl_label = "选择模型材质"
+    bl_description = "根据当前选中网格模型的材质列表勾选材质"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="模式",
+        items=[
+            ('UNION', "并集", "选中所有模型上的全部材质"),
+            ('INTERSECTION', "交集", "仅选中所有模型共有的材质"),
+            ('DIFFERENCE', "差集", "仅选中各模型独有的材质"),
+        ],
+        default='UNION',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return any(obj.type == 'MESH' for obj in context.selected_objects)
+
+    def execute(self, context):
+        # 收集每个模型的非空材质名集合
+        model_mats = []
+        for obj in context.selected_objects:
+            if obj.type != 'MESH':
+                continue
+            names = set()
+            for slot in obj.material_slots:
+                if slot.material and not slot.material.name.startswith("."):
+                    names.add(slot.material.name)
+            if names:
+                model_mats.append(names)
+
+        if not model_mats:
+            self.report({'WARNING'}, "选中模型上没有材质")
+            return {'CANCELLED'}
+
+        if self.mode == 'UNION':
+            result = set.union(*model_mats)
+        elif self.mode == 'INTERSECTION':
+            result = set.intersection(*model_mats)
+        elif self.mode == 'DIFFERENCE':
+            # 统计每个材质在几个模型中出现，仅保留出现次数 == 1 的
+            from collections import Counter
+            cnt = Counter()
+            for names in model_mats:
+                cnt.update(names)
+            result = {name for name, c in cnt.items() if c == 1}
+        else:
+            return {'CANCELLED'}
+
+        settings = context.scene.material_inspector_settings
+        settings.checked_materials.clear()
+
+        if not result:
+            self.report({'INFO'}, "没有符合条件的材质，已清空选择")
+            return {'FINISHED'}
+        # 按当前排序顺序写入
+        for mat in _get_sorted_materials(settings):
+            if mat.name in result:
+                item = settings.checked_materials.add()
+                item.name = mat.name
+
+        self.report({'INFO'}, f"已勾选 {len(result)} 个材质")
+        return {'FINISHED'}
+
+
 class MI_OT_DeleteKey(Operator):
     """Del 键入口 —— 勾选了材质就删材质，没勾选则透传给默认行为"""
     bl_idname = "material_inspector.delete_key"
@@ -1672,6 +1740,15 @@ class MATERIALINSPECTOR_PT_Panel(Panel):
         row.operator("material_inspector.deselect_all", text="取消选择", icon='CHECKBOX_DEHLT')
         row.operator("material_inspector.select_to_before", text="选之前", icon='TRIA_UP')
         row.operator("material_inspector.select_to_after", text="选之后", icon='TRIA_DOWN')
+
+        # ---------- 模型材质选择 ----------
+        row = layout.row(align=True)
+        op = row.operator("material_inspector.select_model_materials", text="选择模型材质（并集）", icon='SELECT_SET')
+        op.mode = 'UNION'
+        op = row.operator("material_inspector.select_model_materials", text="选择模型材质（交集）", icon='SELECT_INTERSECT')
+        op.mode = 'INTERSECTION'
+        op = row.operator("material_inspector.select_model_materials", text="选择模型材质（差集）", icon='SELECT_DIFFERENCE')
+        op.mode = 'DIFFERENCE'
 
         # ---------- 第三排：复制 / 断离 / 重置 / 赋予顶点 ----------
         row = layout.row(align=True)
@@ -1864,6 +1941,7 @@ CLASSES = (
     MI_OT_CleanEmptySlots,
     MI_OT_GeometryPreview,
     MI_OT_ToggleFakeUser,
+    MI_OT_SelectModelMaterials,
     MI_OT_DeleteKey,
     MATERIALINSPECTOR_PT_Panel,
 )
