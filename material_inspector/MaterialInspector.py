@@ -1107,9 +1107,15 @@ class MI_OT_ActivateMaterial(Operator):
                         continue
                     for slot in obj.material_slots:
                         if slot.material == mat:
-                            obj.select_set(True)
+                            try:
+                                obj.select_set(True)
+                            except RuntimeError:
+                                break  # 物体不在当前视图层中（集合被排除），跳过
                             if first:
-                                context.view_layer.objects.active = obj
+                                try:
+                                    context.view_layer.objects.active = obj
+                                except RuntimeError:
+                                    pass
                                 first = False
                             break
             return {'FINISHED'}
