@@ -607,10 +607,13 @@ class MI_OT_DeleteSelectedMaterials(Operator):
             bpy.data.materials.remove(mat)
             deleted += 1
 
-        # 清空勾选
+        # 清空勾选，同步清理收藏
         settings.checked_materials.clear()
         if settings.active_material in mat_names:
             settings.active_material = ""
+        for i in range(len(settings.favorite_materials) - 1, -1, -1):
+            if settings.favorite_materials[i].name in mat_names:
+                settings.favorite_materials.remove(i)
 
         self.report({'INFO'}, f"已删除 {deleted} 个材质")
         return {'FINISHED'}
@@ -771,9 +774,7 @@ class MI_OT_AssignMaterial(Operator):
     bl_idname = "material_inspector.assign_material"
     bl_label = "赋予材质"
     bl_description = (
-        "将勾选的材质赋予选中的模型。"
-        "完全替换模式ON：清空模型材质列表后赋予；"
-        "完全替换模式OFF：追加到模型材质列表末尾"
+        "将勾选的材质赋予选中的模型"
     )
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -960,13 +961,16 @@ class MI_OT_RefreshSinglePreview(Operator):
 
 
 class MI_OT_ActivateMaterial(Operator):
-    """点击预览图 → 单选材质并在着色器编辑器中激活；Shift+点击 → 多选切换"""
+    """点击预览图 → 单选材质并在着色器编辑器中激活；Shift+点击 → 多选切换；Shift+双击 → 范围选择"""
     bl_idname = "material_inspector.activate_material"
     bl_label = "激活材质"
-    bl_description = "单击：独选此材质；Shift：多选/减选；Alt：收藏/取消收藏；Ctrl：选择使用模型"
+    bl_description = "单击：独选此材质；Shift：多选/减选；Shift双击：范围选择；Alt：收藏/取消收藏；Ctrl：选择使用模型"
     bl_options = {'REGISTER', 'UNDO'}
 
     material_name: StringProperty(name="材质名称")
+
+    # 双击检测：记录上次 Shift+点击的时间戳与选择状态快照
+    _shift_click = {}  # {material_name: (timestamp, checked_count_before, active_before)}
 
     def _apply_selection(self, settings: MaterialInspectorSettings, shift: bool) -> None:
         """根据 Shift 状态执行选择逻辑（不涉及着色器编辑器）"""
@@ -989,6 +993,70 @@ class MI_OT_ActivateMaterial(Operator):
                 item.name = self.material_name
                 settings.active_material = self.material_name
 
+    def _range_select(self, settings: MaterialInspectorSettings, context,
+                      checked_before: int, anchor_before: str) -> None:
+        """Shift+双击：范围选择"""
+        mats = _get_sorted_materials(settings)
+        mat_names = [m.name for m in mats]
+        total = len(mat_names)
+
+        if total == 0:
+            return
+
+        # 情况4：过滤列表中所有材质都被选中 → 取消全选
+        if checked_before == total:
+            settings.checked_materials.clear()
+            settings.active_material = ""
+            return
+
+        # 情况1：没有任何材质被选中 → 全选
+        if checked_before == 0:
+            settings.checked_materials.clear()
+            for m in mats:
+                item = settings.checked_materials.add()
+                item.name = m.name
+            settings.active_material = self.material_name
+            return
+
+        # 情况2 & 3：范围选择
+        # 锚点：单选时用该材质，多选时用之前激活的材质
+        anchor_name = anchor_before
+        if checked_before == 1 and not anchor_name:
+            # 只有一个选中但 active 为空（边界情况）
+            anchor_name = settings.checked_materials[0].name
+        elif not anchor_name:
+            anchor_name = self.material_name
+
+        target_name = self.material_name
+
+        if anchor_name not in mat_names or target_name not in mat_names:
+            return
+
+        anchor_idx = mat_names.index(anchor_name)
+        target_idx = mat_names.index(target_name)
+        start = min(anchor_idx, target_idx)
+        end = max(anchor_idx, target_idx)
+
+        # 合并之前的选择（多选时保留）与范围
+        selected = {item.name for item in settings.checked_materials}
+        # 撤销第一次单击产生的 toggle 副作用：反转当前材质的选中状态
+        if self.material_name in selected:
+            selected.discard(self.material_name)
+        else:
+            selected.add(self.material_name)
+
+        for i in range(start, end + 1):
+            selected.add(mat_names[i])
+
+        # 按排序顺序写入
+        settings.checked_materials.clear()
+        for m in mats:
+            if m.name in selected:
+                item = settings.checked_materials.add()
+                item.name = m.name
+
+        settings.active_material = self.material_name
+
     def _activate_shader_editor(self, context: bpy.types.Context) -> set[str]:
         """在着色器编辑器中显示该材质的节点树"""
         mat = bpy.data.materials.get(self.material_name)
@@ -1007,14 +1075,28 @@ class MI_OT_ActivateMaterial(Operator):
                             break
                 return {'FINISHED'}
 
-        # self.report({'INFO'}, f"已激活: {mat.name}")
         return {'FINISHED'}
 
     def invoke(self, context, event):
         """通过 invoke 上下文触发（可获取 Ctrl/Shift/Alt 键状态）"""
         settings = context.scene.material_inspector_settings
 
-        if event.ctrl:
+        if event.shift:
+            now = time.time()
+            entry = self._shift_click.get(self.material_name)
+            if entry and now - entry[0] < 0.3:
+                # Shift+双击 → 范围选择
+                self._shift_click[self.material_name] = (0.0, 0, "")
+                self._range_select(settings, context, entry[1], entry[2])
+                return self._activate_shader_editor(context)
+
+            # Shift+单击：记录快照，然后多选切换
+            checked_before = len(settings.checked_materials)
+            anchor_before = settings.active_material
+            self._shift_click[self.material_name] = (now, checked_before, anchor_before)
+            self._apply_selection(settings, shift=True)
+
+        elif event.ctrl:
             # Ctrl+点击：选择当前场景中所有引用该材质的网格物体
             mat = bpy.data.materials.get(self.material_name)
             if mat:
@@ -1034,9 +1116,6 @@ class MI_OT_ActivateMaterial(Operator):
         elif event.alt:
             # Alt+点击：仅收藏/取消收藏，不改变选择
             _toggle_favorite(settings, self.material_name)
-        elif event.shift:
-            # Shift+点击：多选切换
-            self._apply_selection(settings, shift=True)
         else:
             # 普通点击：独选/取消独选
             self._apply_selection(settings, shift=False)
@@ -1312,6 +1391,69 @@ class MI_OT_ResetSelectedMaterials(Operator):
         return {'FINISHED'}
 
 
+class MI_OT_ClickMaterialName(Operator):
+    """单击选中材质；Shift+单击多选/减选；双击重命名"""
+    bl_idname = "material_inspector.click_material_name"
+    bl_label = "材质名称"
+    bl_description = "单击选中材质（Shift多选）；双击重命名"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    material_name: StringProperty(name="材质名称")
+
+    _last_click = {}           # {material_name: timestamp}
+    _DOUBLE_CLICK_MS = 0.3     # 双击判定间隔（秒）
+
+    def invoke(self, context, event):
+        settings = context.scene.material_inspector_settings
+        now = time.time()
+        last = self._last_click.get(self.material_name, 0.0)
+
+        if now - last < self._DOUBLE_CLICK_MS:
+            # 双击 → 弹出重命名对话框
+            self._last_click[self.material_name] = 0.0
+            return bpy.ops.material_inspector.rename_material(
+                'INVOKE_DEFAULT',
+                material_name=self.material_name,
+            )
+
+        # 单次点击 → 选择材质（与小手按钮逻辑一致，不含 Ctrl/Alt）
+        self._last_click[self.material_name] = now
+
+        if event.shift:
+            _toggle_check(settings, self.material_name)
+            if _is_checked(settings, self.material_name):
+                settings.active_material = self.material_name
+            elif settings.active_material == self.material_name:
+                settings.active_material = ""
+        else:
+            if (len(settings.checked_materials) == 1
+                    and settings.checked_materials[0].name == self.material_name):
+                settings.checked_materials.clear()
+                settings.active_material = ""
+            else:
+                settings.checked_materials.clear()
+                item = settings.checked_materials.add()
+                item.name = self.material_name
+                settings.active_material = self.material_name
+
+        # 在着色器编辑器中激活该材质
+        mat = bpy.data.materials.get(self.material_name)
+        if mat:
+            for area in context.screen.areas:
+                if area.type == 'NODE_EDITOR':
+                    space = area.spaces.active
+                    space.node_tree = mat.node_tree
+                    space.shader_type = 'OBJECT'
+                    if context.object and context.object.type == 'MESH':
+                        for i, slot in enumerate(context.object.material_slots):
+                            if slot.material == mat:
+                                context.object.active_material_index = i
+                                break
+                    break
+
+        return {'FINISHED'}
+
+
 class MI_OT_RenameMaterial(Operator):
     """重命名材质"""
     bl_idname = "material_inspector.rename_material"
@@ -1397,6 +1539,7 @@ class MI_OT_CleanUnusedMaterials(Operator):
         unused = self._get_unused()
         if not unused:
             return {'CANCELLED'}
+        settings = context.scene.material_inspector_settings
         deleted = 0
         for mat_name in unused:
             if mat_name not in bpy.data.materials:
@@ -1414,6 +1557,15 @@ class MI_OT_CleanUnusedMaterials(Operator):
             _cleanup_preview_image(mat_name)
             bpy.data.materials.remove(mat)
             deleted += 1
+        # 清理相关收藏/勾选/激活状态
+        for i in range(len(settings.favorite_materials) - 1, -1, -1):
+            if settings.favorite_materials[i].name in unused:
+                settings.favorite_materials.remove(i)
+        for i in range(len(settings.checked_materials) - 1, -1, -1):
+            if settings.checked_materials[i].name in unused:
+                settings.checked_materials.remove(i)
+        if settings.active_material in unused:
+            settings.active_material = ""
         self.report({'INFO'}, f"已清除 {deleted} 个未使用材质")
         return {'FINISHED'}
 
@@ -1739,9 +1891,22 @@ def _on_depsgraph_update(scene, depsgraph):
         if len(removed) == 1 and len(added) == 1:
             _rename_and_refresh_preview(removed.pop(), added.pop())
         else:
-            # 纯删除 —— 清理预览图
+            # 纯删除 —— 清理预览图 + 同步收藏/勾选/激活状态
             for name in removed:
                 _cleanup_preview_image(name)
+            try:
+                settings = scene.material_inspector_settings
+                for name in removed:
+                    for i in range(len(settings.favorite_materials) - 1, -1, -1):
+                        if settings.favorite_materials[i].name == name:
+                            settings.favorite_materials.remove(i)
+                    for i in range(len(settings.checked_materials) - 1, -1, -1):
+                        if settings.checked_materials[i].name == name:
+                            settings.checked_materials.remove(i)
+                    if settings.active_material == name:
+                        settings.active_material = ""
+            except Exception:
+                pass
             # 纯新增 —— 为新材质生成预览图（通过 timer 延迟，避免在 handler 中直接渲染）
             for name in added:
                 bpy.app.timers.register(
@@ -1953,10 +2118,10 @@ class MATERIALINSPECTOR_PT_Panel(Panel):
                         )
                         op.material_name = mat.name
 
-                    # -- 名称行（重命名按钮） --
+                    # -- 名称行（单击选择，双击重命名） --
                     name_row = col.row(align=True)
                     op = name_row.operator(
-                        "material_inspector.rename_material",
+                        "material_inspector.click_material_name",
                         text=f"[{mat.name}]",
                         icon='MATERIAL',
                     )
@@ -2029,6 +2194,7 @@ CLASSES = (
     MI_OT_UnlinkSelectedMaterials,
     MI_OT_ResetSelectedMaterials,
     MI_OT_RenameMaterial,
+    MI_OT_ClickMaterialName,
     MI_OT_CleanUnusedMaterials,
     MI_OT_CleanUnusedTextures,
     MI_OT_CleanEmptySlots,
