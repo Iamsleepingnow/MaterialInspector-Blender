@@ -117,8 +117,13 @@ class MaterialInspectorSettings(PropertyGroup):
         description="赋予材质时替换当前槽位（关闭则追加到末尾）",
         default=True,
     )
+    shade_first_material: BoolProperty(
+        name="着色最初选择材质",
+        description="赋予材质后将最初选择的材质设为可见材质（关闭则反转顺序，使最后选择的材质可见）",
+        default=True,
+    )
     use_fake_user: BoolProperty(
-        name="资源保护模式",
+        name="新建伪用户材质",
         description="新建材质时开启伪用户，防止未使用即被清理",
         default=True,
     )
@@ -293,62 +298,19 @@ def _cleanup_orphan_previews() -> int:
 #  预览图生成（核心）
 # ============================================================
 
-def generate_material_preview(mat: bpy.types.Material, resolution: int = 256, engine: str = '', geometry: str = 'SPHERE') -> bpy.types.Image:
-    """为单个材质渲染预览图（EEVEE + 球体）
-
-    流程：
-    1. 创建独立的临时场景（球体 + 灯光 + 摄像机）
-    2. 渲染到临时 PNG 文件
-    3. 加载为 Image 数据块并 pack 进 blend 文件
-    4. 清理所有临时对象
-    """
-    if not engine:
-        engine = _EEVEE_ID
-    preview_name = _preview_name(mat.name)
-
-    # 删除同名旧预览
-    if preview_name in bpy.data.images:
-        bpy.data.images.remove(bpy.data.images[preview_name])
-
-    # ---- 保存当前上下文 ----
-    original_scene = bpy.context.window.scene
-    original_selected = list(bpy.context.selected_objects)
-    original_active = bpy.context.view_layer.objects.active
-    original_mode = bpy.context.mode
-    # 保存所有 3D 视图的摄像机设置（防止临时场景渲染后视角偏移）
-    original_viewport_cameras = []
-    for area in bpy.context.screen.areas:
-        if area.type == 'VIEW_3D':
-            for space in area.spaces:
-                if space.type == 'VIEW_3D':
-                    original_viewport_cameras.append((area, space, space.camera, space.lock_camera))
-    # bpy.context.mode 与 mode_set(mode=) 使用不同的字符串，需映射
-    _MODE_MAP = {
-        'EDIT_MESH': 'EDIT',
-        'PAINT_VERTEX': 'VERTEX_PAINT',
-        'PAINT_WEIGHT': 'WEIGHT_PAINT',
-        'PAINT_TEXTURE': 'TEXTURE_PAINT',
-    }
-    restore_mode = _MODE_MAP.get(original_mode, original_mode)
-    # 必须切到 OBJECT 模式，否则编辑模式下创建球体会破坏当前编辑网格
-    if original_mode != 'OBJECT':
-        try:
-            bpy.ops.object.mode_set(mode='OBJECT')
-        except Exception:
-            original_mode = 'OBJECT'  # 切换失败则不恢复
-
-    # ---- 创建临时场景 ----
+def _setup_preview_scene(resolution: int, engine: str, geometry: str, original_scene):
+    """创建临时预览场景，返回包含所有对象引用的字典"""
     tmp_scene = bpy.data.scenes.new("__MI_TempScene__")
     tmp_scene.render.engine = engine
-    # 当使用 Cycles 时，复制当前场景的渲染设备设置（GPU / CPU）
     if engine == 'CYCLES':
         try:
             tmp_scene.cycles.device = original_scene.cycles.device
         except Exception:
-            pass  # 部分 Cycles 版本可能没有此属性
+            pass
     tmp_scene.render.resolution_x = resolution
     tmp_scene.render.resolution_y = resolution
     tmp_scene.render.film_transparent = True
+
     # 灰底背景
     tmp_world = bpy.data.worlds.new("__MI_TempWorld__")
     tmp_world.use_nodes = True
@@ -356,17 +318,17 @@ def generate_material_preview(mat: bpy.types.Material, resolution: int = 256, en
     bg.inputs[0].default_value = (0.12, 0.12, 0.12, 1.0)
     tmp_scene.world = tmp_world
 
-    # ---- 摄像机 ----
+    # 摄像机
     cam_data = bpy.data.cameras.new("__MI_TempCam__")
     cam_data.type = 'PERSP'
     cam_data.lens = 50
     cam_obj = bpy.data.objects.new("__MI_TempCam__", cam_data)
     tmp_scene.collection.objects.link(cam_obj)
     cam_obj.location = (0.0, -3.8, 0.9)
-    cam_obj.rotation_euler = (1.2217, 0.0, 0.0)  # ~70° 俯角
+    cam_obj.rotation_euler = (1.2217, 0.0, 0.0)
     tmp_scene.camera = cam_obj
 
-    # ---- 主光 ----
+    # 主光
     light_data = bpy.data.lights.new("__MI_TempLight__", 'SUN')
     light_data.energy = 5.0
     light_obj = bpy.data.objects.new("__MI_TempLight__", light_data)
@@ -374,7 +336,7 @@ def generate_material_preview(mat: bpy.types.Material, resolution: int = 256, en
     light_obj.location = (-2.5, -2.0, 3.5)
     light_obj.rotation_euler = (0.785, 0.0, 0.785)
 
-    # ---- 补光 ----
+    # 补光
     fill_data = bpy.data.lights.new("__MI_TempFill__", 'SUN')
     fill_data.energy = 1.2
     fill_obj = bpy.data.objects.new("__MI_TempFill__", fill_data)
@@ -382,7 +344,8 @@ def generate_material_preview(mat: bpy.types.Material, resolution: int = 256, en
     fill_obj.location = (2.5, -0.5, 1.0)
     fill_obj.rotation_euler = (-0.5, 0.0, -0.5)
 
-    # ---- 几何体 ----
+    # 几何体（需临时切换到临时场景来创建）
+    bpy.context.window.scene = tmp_scene
     if geometry == 'SPHERE':
         bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(0, 0, 0))
     elif geometry == 'PLANE':
@@ -395,30 +358,23 @@ def generate_material_preview(mat: bpy.types.Material, resolution: int = 256, en
         bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(0, 0, 0))
     geo_obj = bpy.context.active_object
     geo_obj.name = "__MI_TempGeo__"
-    # 从所有当前集合中移除（operator 可能将物体创建在任意活动集合中）
     for col in list(geo_obj.users_collection):
         col.objects.unlink(geo_obj)
-    # 链接到临时场景的主集合
     tmp_scene.collection.objects.link(geo_obj)
-    # 赋予材质
-    if geo_obj.data.materials:
-        geo_obj.data.materials[0] = mat
-    else:
-        geo_obj.data.materials.append(mat)
-    # 着色设置（球体平滑；平面/立方体平直；圆柱体自动平滑）
+
+    # 着色设置
     if geometry == 'SPHERE':
         for poly in geo_obj.data.polygons:
             poly.use_smooth = True
     elif geometry == 'CYLINDER':
         for poly in geo_obj.data.polygons:
             poly.use_smooth = True
-        # 自动平滑：优先旧版属性，不可用时使用 shade_smooth_by_angle 操作符
         try:
             geo_obj.data.use_auto_smooth = True
         except AttributeError:
-            bpy.ops.object.shade_smooth_by_angle(angle=0.523599)  # 30°
+            bpy.ops.object.shade_smooth_by_angle(angle=0.523599)
 
-    # 应用几何体特定造型
+    # 几何体特定造型
     if geometry == 'SPHERE':
         geo_obj.scale = (1.1, 1.1, 1.1)
         geo_obj.location.z = -0.25
@@ -434,65 +390,123 @@ def generate_material_preview(mat: bpy.types.Material, resolution: int = 256, en
         geo_obj.scale = (1.3, 1.3, 0.75)
         geo_obj.location.z = -0.3
 
-    # ---- 渲染到临时文件 ----
-    # 材质名可能含文件系统非法字符，做一次安全替换
+    return {
+        'scene': tmp_scene,
+        'world': tmp_world,
+        'cam_obj': cam_obj, 'cam_data': cam_data,
+        'light_obj': light_obj, 'light_data': light_data,
+        'fill_obj': fill_obj, 'fill_data': fill_data,
+        'geo_obj': geo_obj,
+    }
+
+
+def _render_preview_image(mat: bpy.types.Material, scene: bpy.types.Scene,
+                           geo_obj: bpy.types.Object,
+                           original_scene=None) -> bpy.types.Image:
+    """在已有场景中为材质渲染并加载预览图（不创建/清理场景）"""
+    preview_name = _preview_name(mat.name)
+    if preview_name in bpy.data.images:
+        bpy.data.images.remove(bpy.data.images[preview_name])
+
+    # 赋予材质到几何体第一个槽位
+    if geo_obj.data.materials:
+        geo_obj.data.materials[0] = mat
+    else:
+        geo_obj.data.materials.append(mat)
+
+    # 渲染到临时文件
     safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in mat.name)
     tmp_path = os.path.join(tempfile.gettempdir(), f"__MI_{safe_name}.png")
-    tmp_scene.render.filepath = tmp_path
-    tmp_scene.render.image_settings.file_format = 'PNG'
-    tmp_scene.render.image_settings.color_mode = 'RGBA'
+    scene.render.filepath = tmp_path
+    scene.render.image_settings.file_format = 'PNG'
+    scene.render.image_settings.color_mode = 'RGBA'
 
-    bpy.context.window.scene = tmp_scene
+    bpy.context.window.scene = scene
     bpy.ops.render.render(write_still=True)
 
-    # ---- 加载渲染结果为预览图 ----
-    try:
-        img = bpy.data.images.load(tmp_path)
-        img.name = preview_name
-        img.pack()  # 打包到 blend，避免外部文件依赖
-        img.use_fake_user = True  # 防止未引用时被清理
-        img.update_tag()  # 标记数据变更，强制后续 preview_ensure 使用最新数据
-    finally:
-        # 删除临时文件
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+    # 加载渲染结果（切回原始场景后再加载，确保预览图标在正确的 UI 上下文中生成）
+    if original_scene:
+        bpy.context.window.scene = original_scene
+    img = bpy.data.images.load(tmp_path)
+    img.name = preview_name
+    img.pack()
+    img.use_fake_user = True
+    img.update_tag()
+    img.preview_ensure()
 
-    # ---- 恢复原始场景与摄像机 ----
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
+
+    return img
+
+
+def generate_material_preview(mat: bpy.types.Material, resolution: int = 256, engine: str = '', geometry: str = 'SPHERE') -> bpy.types.Image:
+    """为单个材质渲染预览图（独立场景，自动清理）"""
+    if not engine:
+        engine = _EEVEE_ID
+
+    # ---- 保存当前上下文 ----
+    original_scene = bpy.context.window.scene
+    original_selected = list(bpy.context.selected_objects)
+    original_active = bpy.context.view_layer.objects.active
+    original_mode = bpy.context.mode
+    original_viewport_cameras = []
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            for space in area.spaces:
+                if space.type == 'VIEW_3D':
+                    original_viewport_cameras.append((area, space, space.camera, space.lock_camera))
+    _MODE_MAP = {
+        'EDIT_MESH': 'EDIT',
+        'PAINT_VERTEX': 'VERTEX_PAINT',
+        'PAINT_WEIGHT': 'WEIGHT_PAINT',
+        'PAINT_TEXTURE': 'TEXTURE_PAINT',
+    }
+    restore_mode = _MODE_MAP.get(original_mode, original_mode)
+    if original_mode != 'OBJECT':
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            original_mode = 'OBJECT'
+
+    # ---- 创建场景 + 渲染 ----
+    sd = _setup_preview_scene(resolution, engine, geometry, original_scene)
+    img = _render_preview_image(mat, sd['scene'], sd['geo_obj'])
+
+    # ---- 恢复场景并清理临时对象 ----
     bpy.context.window.scene = original_scene
-    # 还原所有 3D 视图的摄像机设置（必须在清理临时对象之前恢复，否则可能引用已删除的临时摄像机）
     for area, space, cam, lock in original_viewport_cameras:
         space.camera = cam
         space.lock_camera = lock
         area.tag_redraw()
-    for obj in (geo_obj, cam_obj, light_obj, fill_obj):
-        bpy.data.objects.remove(obj, do_unlink=True)
-    for data in (cam_data, light_data, fill_data):
-        bpy.data.cameras.remove(data) if isinstance(data, bpy.types.Camera) else bpy.data.lights.remove(data)  # type: ignore[arg-type]
-    bpy.data.worlds.remove(tmp_world)
-    bpy.data.scenes.remove(tmp_scene)
+    bpy.data.objects.remove(sd['geo_obj'], do_unlink=True)
+    bpy.data.objects.remove(sd['cam_obj'], do_unlink=True)
+    bpy.data.objects.remove(sd['light_obj'], do_unlink=True)
+    bpy.data.objects.remove(sd['fill_obj'], do_unlink=True)
+    bpy.data.cameras.remove(sd['cam_data'])
+    bpy.data.lights.remove(sd['light_data'])
+    bpy.data.lights.remove(sd['fill_data'])
+    bpy.data.worlds.remove(sd['world'])
+    bpy.data.scenes.remove(sd['scene'])
 
     # ---- 恢复原始选择状态 ----
-    # 先取消所有选择
     try:
         bpy.ops.object.select_all(action='DESELECT')
     except Exception:
         pass
-    # 重新选择原始物体（跳过可能已被删除的物体）
     for obj in original_selected:
         try:
             obj.select_set(True)
         except ReferenceError:
             pass
-    # 恢复激活物体
     if original_active is not None:
         try:
             bpy.context.view_layer.objects.active = original_active
         except ReferenceError:
             pass
 
-    # 恢复原始编辑模式
     if original_mode != 'OBJECT':
         try:
             bpy.ops.object.mode_set(mode=restore_mode)
@@ -603,7 +617,7 @@ class MI_OT_DeleteSelectedMaterials(Operator):
 
 
 class MI_OT_UpdatePreviews(Operator):
-    """批量更新材质预览图（分帧执行，避免卡顿）"""
+    """批量更新材质预览图（分帧执行，复用临时场景避免重复搭建）"""
     bl_idname = "material_inspector.update_previews"
     bl_label = "更新材质预览图"
     bl_description = "为项目中所有材质生成预览图"
@@ -617,10 +631,18 @@ class MI_OT_UpdatePreviews(Operator):
     _engine = _EEVEE_ID
     _geometry = 'SPHERE'
 
+    # 批量复用：临时场景及其对象引用
+    _scene_data = None
+    _original_scene = None
+    _original_selected = []
+    _original_active = None
+    _original_mode = ''
+    _original_viewport_cameras = []
+    _restore_mode = ''
+
     def invoke(self, context, _event):
         settings = context.scene.material_inspector_settings
 
-        # 先清理孤立预览图
         orphan_count = _cleanup_orphan_previews()
         if orphan_count > 0:
             self.report({'INFO'}, f"已清理 {orphan_count} 个孤立预览图")
@@ -637,6 +659,37 @@ class MI_OT_UpdatePreviews(Operator):
         self._cursor = 0
         self._total = len(self._queue)
 
+        # ---- 保存当前上下文 ----
+        self._original_scene = context.window.scene
+        self._original_selected = list(context.selected_objects)
+        self._original_active = context.view_layer.objects.active
+        self._original_mode = context.mode
+        self._original_viewport_cameras = []
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D':
+                        self._original_viewport_cameras.append(
+                            (area, space, space.camera, space.lock_camera))
+        _MODE_MAP = {
+            'EDIT_MESH': 'EDIT',
+            'PAINT_VERTEX': 'VERTEX_PAINT',
+            'PAINT_WEIGHT': 'WEIGHT_PAINT',
+            'PAINT_TEXTURE': 'TEXTURE_PAINT',
+        }
+        self._restore_mode = _MODE_MAP.get(self._original_mode, self._original_mode)
+        if self._original_mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                self._original_mode = 'OBJECT'
+
+        # ---- 一次性创建共享预览场景 ----
+        self._scene_data = _setup_preview_scene(
+            self._resolution, self._engine, self._geometry,
+            self._original_scene,
+        )
+
         wm = context.window_manager
         self._timer = wm.event_timer_add(0.05, window=context.window)
         wm.modal_handler_add(self)
@@ -652,10 +705,49 @@ class MI_OT_UpdatePreviews(Operator):
         wm = context.window_manager
 
         if self._cursor >= self._total:
+            # ---- 清理共享场景并恢复上下文 ----
+            bpy.context.window.scene = self._original_scene
+            for area, space, cam, lock in self._original_viewport_cameras:
+                space.camera = cam
+                space.lock_camera = lock
+                area.tag_redraw()
+
+            sd = self._scene_data
+            if sd:
+                bpy.data.objects.remove(sd['geo_obj'], do_unlink=True)
+                bpy.data.objects.remove(sd['cam_obj'], do_unlink=True)
+                bpy.data.objects.remove(sd['light_obj'], do_unlink=True)
+                bpy.data.objects.remove(sd['fill_obj'], do_unlink=True)
+                bpy.data.cameras.remove(sd['cam_data'])
+                bpy.data.lights.remove(sd['light_data'])
+                bpy.data.lights.remove(sd['fill_data'])
+                bpy.data.worlds.remove(sd['world'])
+                bpy.data.scenes.remove(sd['scene'])
+
+            # 恢复选择状态
+            try:
+                bpy.ops.object.select_all(action='DESELECT')
+            except Exception:
+                pass
+            for obj in self._original_selected:
+                try:
+                    obj.select_set(True)
+                except ReferenceError:
+                    pass
+            if self._original_active is not None:
+                try:
+                    context.view_layer.objects.active = self._original_active
+                except ReferenceError:
+                    pass
+            if self._original_mode != 'OBJECT':
+                try:
+                    bpy.ops.object.mode_set(mode=self._restore_mode)
+                except Exception:
+                    pass
+
             wm.event_timer_remove(self._timer)
             wm.progress_end()
             self.report({'INFO'}, f"预览图更新完成（{self._total} 个）")
-            # 刷新 UI
             for area in context.screen.areas:
                 if area.type == 'VIEW_3D':
                     area.tag_redraw()
@@ -663,7 +755,9 @@ class MI_OT_UpdatePreviews(Operator):
 
         mat = self._queue[self._cursor]
         try:
-            generate_material_preview(mat, resolution=self._resolution, engine=self._engine, geometry=self._geometry)
+            _render_preview_image(mat, self._scene_data['scene'],
+                                  self._scene_data['geo_obj'],
+                                  original_scene=self._original_scene)
         except Exception as exc:
             self.report({'ERROR'}, f"预览失败 ({mat.name}): {exc}")
 
@@ -711,14 +805,34 @@ class MI_OT_AssignMaterial(Operator):
                 # ---- 完全替换模式 ----
                 obj.data.materials.clear()
                 _cleanup_plugin_vertex_groups(obj)
-                for mat in materials:
+                ordered = list(materials)
+                if not settings.shade_first_material:
+                    ordered.reverse()
+                for mat in ordered:
                     obj.data.materials.append(mat)
             else:
                 # ---- 追加模式 ----
                 existing = [s.material.name if s.material else "" for s in obj.material_slots]
-                for mat in materials:
-                    if mat.name not in existing:
+                existing_mats = []
+                for s in obj.material_slots:
+                    if s.material and s.material.name not in [m.name for m in materials]:
+                        existing_mats.append(s.material)
+                # 确定新材质的顺序与插入位置
+                ordered_new = list(materials)
+                if settings.shade_first_material:
+                    # 插入到列表最前面：新材质在前，旧材质在后
+                    obj.data.materials.clear()
+                    for mat in ordered_new:
+                        if mat.name not in existing:
+                            obj.data.materials.append(mat)
+                    for mat in existing_mats:
                         obj.data.materials.append(mat)
+                else:
+                    # 反转后追加到末尾
+                    ordered_new.reverse()
+                    for mat in ordered_new:
+                        if mat.name not in existing:
+                            obj.data.materials.append(mat)
 
         mode_text = "替换" if settings.replace_mode else "追加"
         self.report({'INFO'}, f"已将 {len(materials)} 个材质{mode_text}到 {len(targets)} 个对象")
@@ -768,23 +882,14 @@ class MI_OT_AssignToVertices(Operator):
         mat = bpy.data.materials[mat_name]
         obj = context.active_object
 
-        # 从 bmesh 读取选中的面索引及其包含的顶点索引
+        # 统计选中面数（在切换模式前读取，切换后 bmesh 失效）
         bm = bmesh.from_edit_mesh(obj.data)
-        selected_face_indices = [f.index for f in bm.faces if f.select]
-
-        if not selected_face_indices:
+        selected_count = sum(1 for f in bm.faces if f.select)
+        if selected_count == 0:
             self.report({'WARNING'}, "请先选中至少一个面")
             return {'CANCELLED'}
 
-        # 从选中的面收集唯一顶点（用于顶点组）
-        face_vert_set = set()
-        for f in bm.faces:
-            if f.select:
-                for v in f.verts:
-                    face_vert_set.add(v.index)
-        face_vert_indices = list(face_vert_set)
-
-        # ---- 切到 OBJECT 模式操作数据 ----
+        # ---- 切到 OBJECT 模式添加材质槽位 ----
         bpy.ops.object.mode_set(mode='OBJECT')
 
         # 确保材质在物体槽位中
@@ -803,28 +908,12 @@ class MI_OT_AssignToVertices(Operator):
             self.report({'ERROR'}, "无法找到材质槽位")
             return {'CANCELLED'}
 
-        # 创建/更新顶点组，添加选中面包含的顶点（必须在 OBJECT 模式）
-        vg_name = PREVIEW_PREFIX + mat.name
-        vg = obj.vertex_groups.get(vg_name)
-        if vg is None:
-            vg = obj.vertex_groups.new(name=vg_name)
-        vg.add(face_vert_indices, 1.0, 'ADD')
-
-        # ---- 切回 EDIT 模式，Blender 自动保留选择，直接指定材质 ----
+        # ---- 切回 EDIT 模式（面选择自动保留），直接赋予 ----
         bpy.ops.object.mode_set(mode='EDIT')
-        # 确保处于面选择模式，material_slot_assign 才能正确作用
         bpy.ops.mesh.select_mode(type='FACE')
 
         obj.active_material_index = target_slot_idx
         bpy.ops.object.material_slot_assign()
-
-        # 删除临时顶点组（material_slot_assign 已通过面选择完成赋予，VG 不再需要）
-        bpy.ops.object.mode_set(mode='OBJECT')
-        vg = obj.vertex_groups.get(vg_name)
-        if vg:
-            obj.vertex_groups.remove(vg)
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_mode(type='FACE')
 
         # 刷新预览图
         try:
@@ -838,7 +927,7 @@ class MI_OT_AssignToVertices(Operator):
         except Exception:
             pass
 
-        self.report({'INFO'}, f"已将 '{mat.name}' 赋予 {len(selected_face_indices)} 个面")
+        self.report({'INFO'}, f"已将 '{mat.name}' 赋予 {selected_count} 个面")
         return {'FINISHED'}
 
 
@@ -1732,6 +1821,22 @@ class MATERIALINSPECTOR_PT_Panel(Panel):
         row.operator("material_inspector.update_previews", text="更新预览", icon='RENDER_STILL')
         row.operator("material_inspector.assign_material", text="赋予材质", icon='MATERIAL')
 
+        # ---------- 材质操作行（复制 / 断离 / 重置 / 赋予顶点） ----------
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator("material_inspector.copy_selected", text="复制材质", icon='DUPLICATE')
+        row.operator("material_inspector.unlink_selected", text="断离引用", icon='UNLINKED')
+        row.operator("material_inspector.reset_selected", text="重置材质", icon='LOOP_BACK')
+        row.operator("material_inspector.assign_to_vertices", text="赋予顶点", icon='SNAP_VERTEX')
+
+        # ---------- 清理 ----------
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator("material_inspector.delete_selected_materials", text="删除选中", icon='TRASH')
+        row.operator("material_inspector.clean_unused_materials", text="删未使用材质", icon='TRASH')
+        row.operator("material_inspector.clean_unused_textures", text="删未使用纹理", icon='TRASH')
+        row.operator("material_inspector.clean_empty_slots", text="空材质清理", icon='TRASH')
+
         # ---------- 搜索框 ----------
         layout.prop(settings, "search_filter", text="", icon='VIEWZOOM')
 
@@ -1750,13 +1855,6 @@ class MATERIALINSPECTOR_PT_Panel(Panel):
         op.mode = 'INTERSECTION'
         op = row.operator("material_inspector.select_model_materials", text="选择模型材质（差集）", icon='SELECT_DIFFERENCE')
         op.mode = 'DIFFERENCE'
-
-        # ---------- 第三排：复制 / 断离 / 重置 / 赋予顶点 ----------
-        row = layout.row(align=True)
-        row.operator("material_inspector.copy_selected", text="复制材质", icon='DUPLICATE')
-        row.operator("material_inspector.unlink_selected", text="断离引用", icon='UNLINKED')
-        row.operator("material_inspector.reset_selected", text="重置材质", icon='LOOP_BACK')
-        row.operator("material_inspector.assign_to_vertices", text="赋予顶点", icon='SNAP_VERTEX')
 
         layout.separator()
 
@@ -1812,7 +1910,7 @@ class MATERIALINSPECTOR_PT_Panel(Panel):
                             btn_row = box.row(align=True)
                             count = _count_material_users(mat)
                             cnt_row = btn_row.row(align=True)
-                            cnt_row.scale_x = 0.152
+                            cnt_row.scale_x = 0.165
                             op = cnt_row.operator(
                                 "material_inspector.toggle_fake_user",
                                 text=str(count).rjust(0),
@@ -1864,14 +1962,6 @@ class MATERIALINSPECTOR_PT_Panel(Panel):
                     )
                     op.material_name = mat.name
 
-        # ---------- 清理 ----------
-        layout.separator()
-        row = layout.row(align=True)
-        row.operator("material_inspector.delete_selected_materials", text="删除选中", icon='TRASH')
-        row.operator("material_inspector.clean_unused_materials", text="删未使用材质", icon='TRASH')
-        row.operator("material_inspector.clean_unused_textures", text="删未使用纹理", icon='TRASH')
-        row.operator("material_inspector.clean_empty_slots", text="空材质清理", icon='TRASH')
-
         # ---------- 配置 ----------
         layout.separator()
         row = layout.row(align=True)
@@ -1884,7 +1974,9 @@ class MATERIALINSPECTOR_PT_Panel(Panel):
         row.prop(settings, "sort_mode", text="排序")
         row = layout.row(align=True)
         row.prop(settings, "replace_mode", text="完全替换材质")
-        row.prop(settings, "use_fake_user", text="资源保护（伪用户）模式")
+        row.prop(settings, "shade_first_material", text="着色最初选择材质")
+        # row = layout.row(align=True)
+        row.prop(settings, "use_fake_user", text="新建伪用户材质")
 
 
 # ============================================================
